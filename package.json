@@ -1,0 +1,30 @@
+{
+  "name": "web-tmux-cc",
+  "version": "0.2.0",
+  "description": "The tmux plugin in a standalone web page.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/adrianleb/web-tmux-cc.git"
+  },
+  "homepage": "https://github.com/adrianleb/web-tmux-cc#readme",
+  "bugs": { "url": "https://github.com/adrianleb/web-tmux-cc/issues" },
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=22.6" },
+  "bin": { "web-tmux-cc": "dist/server.js" },
+  "files": ["dist", "LICENSE", "README.md"],
+  "scripts": {
+    "build": "node build.mjs",
+    "start": "node dist/server.js",
+    "test": "node --test test.mjs",
+    "prepack": "npm run build"
+  },
+  "dependencies": { "ws": "^8.21.3" },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "@xterm/xterm": "^6.0.0",
+    "esbuild": "^0.28.2",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
+  }
+}

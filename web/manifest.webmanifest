@@ -1,0 +1,10 @@
+{
+  "name": "web-tmux-cc",
+  "short_name": "tmux",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#181a1f",
+  "theme_color": "#181a1f",
+  "icons": [{ "src": "./icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+}

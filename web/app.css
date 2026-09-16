@@ -1,0 +1,39 @@
+:root {
+  color-scheme: dark;
+  --dsw-alias-bg-layer-1: #181a1f;
+  --dsw-alias-bg-layer-2: #252830;
+  --dsw-alias-label-primary: #f1f1f1;
+  --dsw-alias-label-secondary: #b7bac3;
+  --dsw-alias-label-tertiary: #9196a2;
+  --dsw-alias-border-l1: #30343d;
+  --dsw-alias-border-l2: #424753;
+  --dsw-alias-interactive-bg-hover: #343843;
+  --dsw-alias-interactive-bg-hover-accent: #668ac9;
+  --dsw-alias-brand-primary: #8cb4f4;
+  --dsw-alias-state-error-primary: #ff9b9b;
+  font: 14px/1.5 ui-sans-serif, system-ui, sans-serif;
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-alias-bg-layer-1);
+}
+html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; overscroll-behavior: none; }
+button, input, select { font: inherit; }
+#web-tmux-cc-root { position: fixed; inset: 0; overflow: hidden; }
+[data-tmux-cc-header] {
+  display: flex; align-items: center; gap: 8px; flex: none; min-width: 0;
+  padding: env(safe-area-inset-top) max(8px, env(safe-area-inset-right)) 0 max(8px, env(safe-area-inset-left));
+  border-bottom: 1px solid var(--dsw-alias-border-l2);
+}
+[data-tmux-cc-header] strong {
+  flex: none; font-size: 12px; font-weight: 600; white-space: nowrap;
+}
+[data-tmux-cc-settings] { width: min(600px, calc(100vw - 24px)); }
+[data-tmux-cc-loading] {
+  height: 100%; display: flex; align-items: center; justify-content: center;
+  flex-direction: column; gap: 12px; color: var(--dsw-alias-label-secondary);
+}
+[data-tmux-cc-loading] img { width: 56px; height: 56px; }
+[data-tmux-cc-loading] strong { color: var(--dsw-alias-label-primary); }
+@media (max-width: 480px) {
+  [data-tmux-cc-header] { gap: 4px; }
+  [data-tmux-cc-header] strong { font-size: 11px; }
+}
