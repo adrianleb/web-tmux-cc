@@ -445,6 +445,8 @@ export class TmuxControlClient extends EventEmitter<Events> {
       this.refreshTimer = null
       if (!this.attached) return
       void this.refreshSnapshot().catch((err: unknown) => {
+        // A refresh queued by the last layout change can lose to a detach; that is not an error.
+        if (!this.attached) return
         this.emit('error', err instanceof Error ? err.message : String(err))
       })
     }, 80)
