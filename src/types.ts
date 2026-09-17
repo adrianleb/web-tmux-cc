@@ -179,6 +179,8 @@ export type ClientToHost =
   | { type: 'detach' }
   | { type: 'refresh' }
   | { type: 'capture'; pane?: string; lines?: number }
+  /** Bytes of `output`/`history` data the browser has finished rendering. */
+  | { type: 'ack'; bytes: number }
 
 export type HostToClient =
   | { type: 'snapshot'; snapshot: Snapshot }

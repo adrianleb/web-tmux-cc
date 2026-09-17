@@ -23,7 +23,9 @@ Every pane renders its exact tmux grid at one shared font size. Pane titles live
 
 Sizing policy (Settings, shared by the host): **Primary** (default) makes the page the window's sizing client — it resizes the tmux window to fit itself at your font size even while a terminal or iTerm2 `-CC` client is attached (those see the window at the page's size until the page detaches, which hands sizing back). With several pages on one session, the one you last typed in or resized is the sizer and the others mirror it. **Auto** takes over only when no other sizing client exists. **Mirror** never resizes tmux: the page shows the exact remote grid, shrinking the font to fit the height, never below the touch text size on phones and tablets. The header pill shows the effective mode and the current grid. Pinch zoom magnifies the page without shrinking the tmux grid. The header stays on one row, with horizontally scrollable controls when space is tight.
 
-Reconnecting re-seeds each pane from `capture-pane`, restoring the cursor position, line-drawing charset, alternate screen, and mouse/cursor modes so TUI panes keep scrolling and prompts keep their cursor after a reload.
+Reconnecting re-seeds each pane from `capture-pane`, restoring the cursor position, line-drawing charset, alternate screen, and mouse/cursor modes so TUI panes keep scrolling and prompts keep their cursor after a reload. Attaching transfers only each pane's visible screen; scrollback is fetched the first time you scroll up in a pane, at the configured depth.
+
+Output floods (a TUI re-rendering a long transcript after a resize, a `cat` of a large file) are not replayed. The server drains tmux's control channel at a bounded rate — slower while the browser still has unrendered output — so tmux's `pause-after` drops the flood's backlog for this client instead of holding the pane to the browser's pace; the pane then re-syncs from a short capture of its final screen. Panes run at full speed and a 20 MB burst costs the browser a couple of megabytes and no stall.
 
 For a global installation, `npm install -g .` installs the `web-tmux-cc` executable, which starts the server directly. There are no subcommands. Hosting, HTTPS, and access control belong to your deployment, not this application.
 
@@ -32,7 +34,7 @@ For a global installation, `npm install -g .` installs the `web-tmux-cc` executa
 The [GitHub releases](https://github.com/adrianleb/web-tmux-cc/releases) include a prebuilt npm package. With Node.js 22.6+ and tmux installed:
 
 ```sh
-npm install -g https://github.com/adrianleb/web-tmux-cc/releases/download/v0.3.0/web-tmux-cc-0.3.0.tgz
+npm install -g https://github.com/adrianleb/web-tmux-cc/releases/download/v0.3.1/web-tmux-cc-0.3.1.tgz
 web-tmux-cc
 ```
 

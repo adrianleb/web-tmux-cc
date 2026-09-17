@@ -545,3 +545,60 @@ test('primary sizing overrides other sizing clients and hands back on detach', {
     await rm(dir, { recursive: true, force: true })
   }
 })
+
+test('an output flood pauses the pane instead of replaying it and re-syncs to the final screen', { timeout: 90000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'web-tmux-flood-test-'))
+  const socket = `web-tmux-flood-test-${randomUUID()}`
+  const binary = process.env.TMUX_TEST_BIN || 'tmux'
+  const native = (...args) => exec(binary, ['-L', socket, '-f', '/dev/null', ...args])
+  const wrapper = join(dir, 'tmux')
+  const quote = value => `'${value.replaceAll("'", "'\\''")}'`
+  await writeFile(wrapper, `#!/bin/sh\nexec ${quote(binary)} -L ${quote(socket)} -f /dev/null "$@"\n`, { mode: 0o755 })
+  // 20 MB of styled text: a TUI re-rendering a long transcript on resize.
+  const flood = join(dir, 'flood.txt')
+  const line = Array.from({ length: 30 }, (_, i) => `\x1b[38;5;${17 + (i * 7) % 200}mword${i}\x1b[0m`).join(' ')
+  await writeFile(flood, Array.from({ length: 24000 }, (_, i) => `${i + 1} ${line}\n`).join(''))
+  let app, browser
+  try {
+    await native('new-session', '-d', '-s', 'flood', '-x', '120', '-y', '40', 'sh')
+    await native('send-keys', '-t', 'flood', "PS1='READY> '", 'Enter')
+    await expect.poll(async () => (await native('capture-pane', '-p', '-t', 'flood')).stdout, { timeout: 15000 }).toContain('READY>')
+    app = await startServer({ port: 0, tmuxBin: wrapper, settingsFile: join(dir, 'settings.json') })
+    browser = await browserType.launch({ headless: true })
+    const context = await browser.newContext({ viewport: { width: 1280, height: 800 } })
+    const page = await context.newPage()
+    const errors = []
+    page.on('pageerror', error => errors.push(error.message))
+    let received = 0
+    let outputs = 0
+    page.on('websocket', ws => ws.on('framereceived', ({ payload }) => {
+      received += payload.length
+      try { if (JSON.parse(payload).type === 'output') outputs += 1 } catch { /* ignore */ }
+    }))
+    await page.goto(app.url + '?session=flood')
+    await expect.poll(() => page.locator('.xterm-rows').innerText(), { timeout: 15000 }).toContain('READY>')
+    received = 0
+    outputs = 0
+    const started = Date.now()
+    await native('send-keys', '-t', 'flood', `cat ${flood}; echo FLOOD-DONE`, 'Enter')
+    await expect.poll(async () => (await native('capture-pane', '-p', '-t', 'flood')).stdout, { timeout: 60000 }).toContain('FLOOD-DONE')
+    const paneMs = Date.now() - started
+    // The page shows the pane's final screen without having replayed the flood.
+    await expect.poll(() => page.locator('.xterm-rows').innerText(), { timeout: 20000 }).toContain('FLOOD-DONE')
+    assert.ok(received < 8_000_000, `browser received ${received} bytes of a 20 MB flood; it should have been paused and re-synced`)
+    assert.ok(paneMs < 30000, `the pane took ${paneMs}ms; the browser must not throttle it to the control channel`)
+    // Ordinary output still flows live afterwards.
+    outputs = 0
+    await page.locator('.xterm').click()
+    await page.keyboard.type('echo AFTER-FLOOD')
+    await page.keyboard.press('Enter')
+    await expect.poll(() => page.locator('.xterm-rows').innerText(), { timeout: 15000 }).toContain('AFTER-FLOOD')
+    assert.ok(outputs > 0, 'live output resumed after the pause')
+    assert.deepEqual(errors, [])
+  } finally {
+    if (browser) await browser.close()
+    if (app) await app.close()
+    await native('kill-server').catch(() => {})
+    await rm(dir, { recursive: true, force: true })
+  }
+})

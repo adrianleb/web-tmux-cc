@@ -39,6 +39,9 @@ export interface TmuxSnapshot {
 export interface ControlTransport {
   write(data: string): void
   kill(): void
+  /** Stop/resume reading tmux's output; unread bytes back up into tmux. */
+  pause(): void
+  resume(): void
   onData(fn: (chunk: string) => void): void
   onStderr(fn: (chunk: string) => void): void
   onExit(fn: (code: number | null) => void): void
@@ -66,6 +69,8 @@ interface OpenBlock {
 interface Events {
   snapshot: [TmuxSnapshot]
   output: [paneId: string, data: string]
+  /** tmux paused a pane for this client (pause-after): its backlog is gone. */
+  pause: [paneId: string]
   error: [message: string]
   /** Fired only for unexpected exits — a requested detach never emits this. */
   exit: [code: number | null]
@@ -79,6 +84,23 @@ export interface HistoryCapture {
 export const DEFAULT_HISTORY_LINES = 2000
 export const MAX_HISTORY_LINES = 20000
 export const MAX_HISTORY_BYTES = 800000
+
+/**
+ * Control-channel flow control. tmux writes to a control client in 8 KB
+ * turns (~2 MB/s) and disables a pane's read while every control client is
+ * busy, so reading eagerly both floods the browser and throttles the pane.
+ * Draining at a bounded rate lets a burst age into a %pause after
+ * PAUSE_AFTER_SECONDS; the pane then runs free and the browser re-syncs
+ * from a capture. The "behind" rate applies while the browser has not yet
+ * consumed what it was sent (a slow link or device), so tmux sees its lag.
+ */
+export const PAUSE_AFTER_SECONDS = 1
+const DRAIN_RATE = 1_000_000  // bytes/s of control output while the browser keeps up
+const DRAIN_RATE_BEHIND = 32_000
+const DRAIN_WINDOW_MS = 100
+const DRAIN_MAX_PAUSE_MS = 2000
+/** A deep capture of a wide, heavily styled pane can be megabytes. */
+const CAPTURE_TIMEOUT_MS = 30_000
 
 export function normalizeHistoryLines(value: unknown): number {
   const parsed = Number(value)
@@ -106,6 +128,20 @@ export class TmuxControlClient extends EventEmitter<Events> {
   private refreshTimer: ReturnType<typeof setTimeout> | null = null
   private drainScheduled = false
   private processingInput = false
+  /**
+   * Deliberate drain. tmux only pauses a flooding pane (pause-after) when
+   * its client falls behind; a client that drains as fast as tmux writes
+   * never does, so it receives every byte of a re-render storm and throttles
+   * the pane to the control channel's own ~2 MB/s. Reading at a bounded rate
+   * lets floods age into a %pause while ordinary output flows, and holding
+   * the drain while the browser still owes acks lets the real consumer's
+   * link set the pace.
+   */
+  private drainRate = DRAIN_RATE
+  private drainUsed = 0
+  private drainWindowStart = 0
+  private drainPaused = false
+  private drainTimer: ReturnType<typeof setTimeout> | null = null
   readonly tmuxBin: string
   private readonly spawnTransport: SpawnTransport
   private readonly commandTimeoutMs: number
@@ -152,7 +188,9 @@ export class TmuxControlClient extends EventEmitter<Events> {
     // client may still flush data/exit during its grace period, and that must
     // never leak into the successor's state.
     transport.onData((chunk) => {
-      if (this.transport === transport) this.push(chunk)
+      if (this.transport !== transport) return
+      this.push(chunk)
+      this.accountDrain(chunk.length)
     })
     transport.onStderr((chunk) => {
       if (this.transport === transport) this.stderrTail = (this.stderrTail + chunk).slice(-500)
@@ -167,6 +205,9 @@ export class TmuxControlClient extends EventEmitter<Events> {
     })
     try {
       this.clientName = (await this.command("display-message -p '#{client_name}'")).trim()
+      // Fall PAUSE_AFTER_SECONDS behind on a pane and tmux drops that pane's
+      // backlog for us (%pause) instead of holding the pane to our pace.
+      await this.command(`refresh-client -f pause-after=${PAUSE_AFTER_SECONDS}`)
       await this.refreshSnapshot()
     } catch (err) {
       const detail = this.stderrTail.trim()
@@ -175,13 +216,61 @@ export class TmuxControlClient extends EventEmitter<Events> {
     }
   }
 
+  /**
+   * Slow the drain while the browser has not consumed what it was sent, so
+   * tmux measures the real consumer's lag and pauses floods accordingly.
+   * Never a full stop: tmux only evaluates block ages when it can write.
+   */
+  setBehind(behind: boolean): void {
+    this.drainRate = behind ? DRAIN_RATE_BEHIND : DRAIN_RATE
+  }
+
+  /** Resume a pane tmux paused for this client; new output flows from now on. */
+  async continuePane(paneId: string): Promise<void> {
+    await this.command(`refresh-client -A ${quote(`${paneId}:continue`)}`)
+  }
+
+  /**
+   * Token bucket over the control channel. Pipe reads arrive in 64 KB
+   * chunks, so an overshoot is paid off by pausing long enough that the
+   * average over window + pause equals the rate. Command replies share the
+   * channel and the rate: a capture is small, and a flood must never be
+   * able to lift the limit by keeping a command in flight.
+   */
+  private accountDrain(bytes: number): void {
+    const transport = this.transport
+    if (transport === null) return
+    const now = Date.now()
+    if (now - this.drainWindowStart >= DRAIN_WINDOW_MS) {
+      this.drainWindowStart = now
+      this.drainUsed = 0
+    }
+    this.drainUsed += bytes
+    if (this.drainPaused || this.drainUsed <= this.drainRate * DRAIN_WINDOW_MS / 1000) return
+    const pauseMs = Math.min(DRAIN_MAX_PAUSE_MS, Math.round(this.drainUsed / this.drainRate * 1000) - (now - this.drainWindowStart))
+    this.drainPaused = true
+    transport.pause()
+    this.drainTimer = setTimeout(() => {
+      this.drainTimer = null
+      this.drainPaused = false
+      this.drainWindowStart = Date.now()
+      this.drainUsed = 0
+      if (this.transport === transport) transport.resume()
+    }, Math.max(1, pauseMs))
+  }
+
   detach(): void {
-    if (this.refreshTimer) clearTimeout(this.refreshTimer)
+    clearTimeout(this.refreshTimer ?? undefined)
     this.refreshTimer = null
+    clearTimeout(this.drainTimer ?? undefined)
+    this.drainTimer = null
+    this.drainPaused = false
+    this.drainRate = DRAIN_RATE
     const transport = this.transport
     if (transport !== null) {
       this.requestedDetach = true
       this.transport = null
+      transport.resume()
       try { transport.write('detach-client\n') } catch { /* already gone */ }
       // The %exit handshake normally lands well within the grace period.
       setTimeout(() => { try { transport.kill() } catch { /* already gone */ } }, 250)
@@ -246,7 +335,7 @@ export class TmuxControlClient extends EventEmitter<Events> {
       const raw = await this.command([
         `display-message -p -t ${target} -F ${quote(`M\t${PANE_SEED_FORMAT}`)}`,
         `if-shell -F -t ${target} '#{alternate_on}' "capture-pane -ep -t ${target} -S -${historyLines}" "capture-pane -epJ -t ${target} -S -${historyLines}"`,
-      ].join(' ; '), 3)
+      ].join(' ; '), 3, CAPTURE_TIMEOUT_MS)
       const lines = raw.split('\n')
       const marker = lines.findIndex((line) => line.startsWith('M\t'))
       if (marker < 0) continue
@@ -457,7 +546,7 @@ export class TmuxControlClient extends EventEmitter<Events> {
    * one block per command (plus one per command a `if-shell` inserts), so
    * callers pass how many blocks to gather; the parts are joined with `\n`.
    */
-  private command(line: string, blocks = 1): Promise<string> {
+  private command(line: string, blocks = 1, timeoutMs = this.commandTimeoutMs): Promise<string> {
     const transport = this.transport
     if (transport === null) return Promise.reject(new Error('not attached'))
     const { promise, resolve, reject } = Promise.withResolvers<string>()
@@ -474,7 +563,7 @@ export class TmuxControlClient extends EventEmitter<Events> {
       timer: setTimeout(() => {
         pending.settled = true
         reject(new Error(`tmux command timed out: ${line.split(' ')[0]}`))
-      }, this.commandTimeoutMs),
+      }, timeoutMs),
     }
     this.queue.push(pending)
     transport.write(`${line}\n`)
@@ -555,6 +644,16 @@ export class TmuxControlClient extends EventEmitter<Events> {
       this.emit('output', rest.slice(0, sp), decodeControlOutput(rest.slice(sp + 1)))
       return
     }
+    // With pause-after set, tmux reports output as `%extended-output pane age : data`,
+    // where age is how long (ms) it held the data before sending.
+    if (line.startsWith('%extended-output ')) {
+      const rest = line.slice('%extended-output '.length)
+      const sp = rest.indexOf(' ')
+      const sep = rest.indexOf(' : ')
+      if (sp < 0 || sep < 0) return
+      this.emit('output', rest.slice(0, sp), decodeControlOutput(rest.slice(sep + 3)))
+      return
+    }
     if (
       line.startsWith('%layout-change ')
       || line.startsWith('%window-pane-changed ')
@@ -568,6 +667,10 @@ export class TmuxControlClient extends EventEmitter<Events> {
       || line.startsWith('%unlinked-window-close ')
     ) {
       this.scheduleRefresh()
+      return
+    }
+    if (line.startsWith('%pause ')) {
+      this.emit('pause', line.slice('%pause '.length).trim())
       return
     }
     if (line.startsWith('%exit')) {
@@ -742,6 +845,8 @@ function defaultTransport(tmuxBin: string, args: string[]): ControlTransport {
       if (!child.stdin.destroyed && child.stdin.writable) child.stdin.write(data, () => {})
     },
     kill: () => { child.kill() },
+    pause: () => { child.stdout.pause() },
+    resume: () => { child.stdout.resume() },
     onData: (fn) => { child.stdout.on('data', fn) },
     onStderr: (fn) => { child.stderr.on('data', fn) },
     onExit: (fn) => { child.on('exit', (code) => fn(code)) },

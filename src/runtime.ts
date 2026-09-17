@@ -37,6 +37,17 @@ interface CaptureRequest {
   lines?: number
   panes: Set<string> | null
 }
+
+/**
+ * Browser-side flow control. Pane bytes stay "unacked" until the page has
+ * rendered them; past UNACKED_HIGH the control drain holds so tmux sees the
+ * browser's lag and pauses floods, and resumes under UNACKED_LOW. A paused
+ * pane re-syncs from a short capture rather than the full history.
+ */
+const UNACKED_HIGH = 128_000
+const UNACKED_LOW = 32_000
+const RESYNC_HISTORY_LINES = 100
+const RESYNC_COOLDOWN_MS = 750
 /** Session → socket that most recently resized, typed, or attached. */
 const primarySizers = new Map<string, SocketLike>()
 
@@ -76,6 +87,12 @@ export class TmuxRuntime {
   /** Pending captures per socket (`panes: null` = every visible pane) and one active drain globally. */
   private captureRequests = new Map<SocketLike, CaptureRequest>()
   private captureTask: Promise<void> | null = null
+  /** Bytes of pane data sent to each socket and not yet reported rendered. */
+  private unacked = new Map<SocketLike, number>()
+  private behind = false
+  /** Per-pane re-sync throttle: last capture time and a pending trailing capture. */
+  private resyncAt = new Map<string, number>()
+  private resyncTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private readonly management: TmuxManagement
   /** Inventory, management writes, and wire attachment changes share one queue. */
   private managementTask: Promise<void> = Promise.resolve()
@@ -200,7 +217,7 @@ export class TmuxRuntime {
     this.attachmentGeneration += 1
     await this.restoreManualWindows()
     this.resetSizeState(false)
-    this.captureRequests.clear()
+    this.clearResyncs()
     this.client?.detach()
     void this.snapshot().then((snap) => this.broadcast({ type: 'snapshot', snapshot: snap }))
       .catch((error: unknown) => this.broadcastError(error))
@@ -213,7 +230,7 @@ export class TmuxRuntime {
     const restored = this.restoreManualWindows()
     if (this.sizingSocket) this.releaseSizing(this.sizingSocket)
     this.resetSizeState(true)
-    this.captureRequests.clear()
+    this.clearResyncs()
     this.client = null
     for (const socket of this.sockets) socket.close(1001, 'plugin unload')
     this.sockets.clear()
@@ -376,6 +393,13 @@ export class TmuxRuntime {
     return { cols, rows }
   }
 
+  private clearResyncs(): void {
+    this.captureRequests.clear()
+    for (const timer of this.resyncTimers.values()) clearTimeout(timer)
+    this.resyncTimers.clear()
+    this.resyncAt.clear()
+  }
+
   private resetSizeState(clearDesiredSizes: boolean): void {
     this.sizeMode = 'mirror'
     this.appliedSize = ''
@@ -461,6 +485,8 @@ export class TmuxRuntime {
     socket.on('close', () => {
       this.sockets.delete(socket)
       this.captureRequests.delete(socket)
+      this.unacked.delete(socket)
+      this.syncBehind()
       this.releaseSizing(socket)
       if (this.sizingSocket === socket) this.sizingSocket = null
       // A departing viewer may unblock a larger shared grid.
@@ -519,7 +545,16 @@ export class TmuxRuntime {
         })
     })
     client.on('output', (pane, data) => {
-      this.broadcast({ type: 'output', pane, data })
+      const raw = JSON.stringify({ type: 'output', pane, data } satisfies HostToClient)
+      for (const socket of this.sockets) this.sendData(socket, raw, data.length)
+    })
+    client.on('pause', (pane) => {
+      // tmux dropped this pane's backlog for us. Resume first so nothing
+      // produced meanwhile is lost, then re-sync every viewer from a short
+      // capture: a flood's intermediate frames are not worth replaying.
+      void client.continuePane(pane)
+        .catch(() => { /* pane may have closed */ })
+        .finally(() => this.scheduleResync(pane))
     })
     client.on('error', (message) => {
       this.broadcast({ type: 'error', message })
@@ -528,7 +563,7 @@ export class TmuxRuntime {
       // Only unexpected exits arrive here; a requested detach broadcasts from detach().
       this.resetSizeState(false)
       this.attachmentGeneration += 1
-      this.captureRequests.clear()
+      this.clearResyncs()
       void this.snapshot().then((snap) => this.broadcast({
         type: 'snapshot',
         snapshot: { ...snap, attached: false, error: 'tmux control client exited' },
@@ -598,7 +633,7 @@ export class TmuxRuntime {
             || this.attachmentGeneration !== generation
           ) break
           for (const capture of captures) {
-            socket.send(JSON.stringify({ type: 'history', ...capture } satisfies HostToClient))
+            this.sendData(socket, JSON.stringify({ type: 'history', ...capture } satisfies HostToClient), capture.data.length)
           }
         }
       } catch (err) {
@@ -666,6 +701,11 @@ export class TmuxRuntime {
     }
     if (msg.type === 'capture') {
       this.requestCapture(socket, msg.lines, msg.pane)
+      return
+    }
+    if (msg.type === 'ack') {
+      const bytes = Number(msg.bytes)
+      if (Number.isFinite(bytes) && bytes > 0) this.ack(socket, bytes)
       return
     }
     if (msg.type === 'attach') {
@@ -777,6 +817,52 @@ export class TmuxRuntime {
       if (socket === skip) continue
       try { socket.send(raw) } catch { /* closed */ }
     }
+  }
+
+  /** Send pane bytes and remember them until the browser reports them rendered. */
+  private sendData(socket: SocketLike, raw: string, bytes: number): void {
+    if (!this.sockets.has(socket)) return
+    try { socket.send(raw) } catch { return }
+    this.unacked.set(socket, (this.unacked.get(socket) ?? 0) + bytes)
+    this.syncBehind()
+  }
+
+  private ack(socket: SocketLike, bytes: number): void {
+    const left = (this.unacked.get(socket) ?? 0) - bytes
+    this.unacked.set(socket, Math.max(0, left))
+    this.syncBehind()
+  }
+
+  /** Slow the control drain while any browser still owes more than a window of data. */
+  private syncBehind(): void {
+    let behind = false
+    for (const bytes of this.unacked.values()) {
+      if (bytes > UNACKED_HIGH) behind = true
+    }
+    if (behind === this.behind) return
+    if (!behind) {
+      // Hysteresis: only clear once every browser is well under the window.
+      for (const bytes of this.unacked.values()) if (bytes > UNACKED_LOW) return
+    }
+    this.behind = behind
+    this.client?.setBehind(behind)
+  }
+
+  /**
+   * A paused pane re-syncs at most once per RESYNC_COOLDOWN_MS; a pause that
+   * lands inside the cooldown schedules one trailing capture, so a burst of
+   * pauses costs one capture per cooldown and the final state always lands.
+   */
+  private scheduleResync(pane: string): void {
+    if (this.resyncTimers.has(pane)) return
+    const wait = Math.max(0, (this.resyncAt.get(pane) ?? 0) + RESYNC_COOLDOWN_MS - Date.now())
+    const fire = (): void => {
+      this.resyncTimers.delete(pane)
+      this.resyncAt.set(pane, Date.now())
+      for (const socket of this.sockets) this.requestCapture(socket, RESYNC_HISTORY_LINES, pane)
+    }
+    if (wait === 0) fire()
+    else this.resyncTimers.set(pane, setTimeout(fire, wait))
   }
 
   private toSnapshot(snap: TmuxSnapshot, attached: boolean): Snapshot {
