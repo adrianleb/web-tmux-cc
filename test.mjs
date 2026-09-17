@@ -685,3 +685,58 @@ test('on a phone, tapping a pane focuses it and the key bar sends the keys the o
     await rm(dir, { recursive: true, force: true })
   }
 })
+
+test('an idle viewer never steals sizing from the device in use, and terminal queries get one answer', { timeout: 60000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'web-tmux-idle-test-'))
+  const socket = `web-tmux-idle-test-${randomUUID()}`
+  const binary = process.env.TMUX_TEST_BIN || 'tmux'
+  const native = (...args) => exec(binary, ['-L', socket, '-f', '/dev/null', ...args])
+  const wrapper = join(dir, 'tmux')
+  const quote = value => `'${value.replaceAll("'", "'\\''")}'`
+  await writeFile(wrapper, `#!/bin/sh\nexec ${quote(binary)} -L ${quote(socket)} -f /dev/null "$@"\n`, { mode: 0o755 })
+  let app, browser
+  try {
+    await native('new-session', '-d', '-s', 'idle', '-x', '100', '-y', '30', 'sh')
+    await native('send-keys', '-t', 'idle', "PS1='> '", 'Enter')
+    app = await startServer({ port: 0, tmuxBin: wrapper, settingsFile: join(dir, 'settings.json') })
+    browser = await browserType.launch({ headless: true })
+    const grid = async () => (await native('display-message', '-p', '-t', 'idle', '#{window_width}x#{window_height}')).stdout.trim()
+    // A desktop page attaches first and is then left alone.
+    const desktopContext = await browser.newContext({ viewport: { width: 1280, height: 800 } })
+    const desktop = await desktopContext.newPage()
+    await desktop.goto(app.url + '?session=idle')
+    await expect(desktop.locator('[data-tmux-cc-shell]')).toHaveAttribute('data-size-mode', 'takeover')
+    const desktopGrid = await grid()
+    // Then a phone attaches and its user taps a pane.
+    const phoneContext = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true })
+    const phone = await phoneContext.newPage()
+    await phone.goto(app.url + '?session=idle')
+    await expect(phone.locator('.xterm')).toHaveCount(1)
+    await phone.locator('[data-tmux-cc-touch]').tap()
+    await expect(phone.locator('[data-tmux-cc-shell]')).toHaveAttribute('data-size-mode', 'takeover')
+    await expect.poll(grid, { timeout: 10000 }).not.toBe(desktopGrid)
+    const phoneGrid = await grid()
+    await expect(desktop.locator('[data-tmux-cc-shell]')).toHaveAttribute('data-size-mode', 'mirror')
+    // The pane program queries its terminal, as TUIs do on every redraw.
+    // Both browsers' xterms see the query; neither may answer it (tmux does,
+    // once), and the window must stay at the phone's size. Raw mode reads the
+    // exact bytes; a shell would swallow part of a reply as a key prefix.
+    await native('send-keys', '-t', 'idle', String.raw`clear; stty raw -echo; printf '\033[6n\033[6n'; sleep 1; dd bs=1000 count=1 2>/dev/null | od -An -c; stty sane; echo END`, 'Enter')
+    await expect.poll(async () => (await native('capture-pane', '-p', '-t', 'idle')).stdout, { timeout: 15000 }).toContain('END')
+    const replies = ((await native('capture-pane', '-p', '-t', 'idle')).stdout.match(/033\s+\[\s+\d+\s+;\s+\d+\s+R/g) || []).length
+    assert.equal(replies, 2, 'the two queries get exactly the two replies tmux itself produces')
+    await phone.waitForTimeout(1500)
+    assert.equal(await grid(), phoneGrid, 'terminal replies from the idle desktop must not move the window')
+    await expect(phone.locator('[data-tmux-cc-shell]')).toHaveAttribute('data-size-mode', 'takeover')
+    await expect(desktop.locator('[data-tmux-cc-shell]')).toHaveAttribute('data-size-mode', 'mirror')
+    // A real click on the desktop takes sizing back.
+    await desktop.locator('[data-tmux-cc-pane]').click()
+    await expect.poll(grid, { timeout: 10000 }).toBe(desktopGrid)
+    await expect(desktop.locator('[data-tmux-cc-shell]')).toHaveAttribute('data-size-mode', 'takeover')
+  } finally {
+    if (browser) await browser.close()
+    if (app) await app.close()
+    await native('kill-server').catch(() => {})
+    await rm(dir, { recursive: true, force: true })
+  }
+})

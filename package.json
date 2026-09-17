@@ -1,6 +1,6 @@
 {
   "name": "web-tmux-cc",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "The tmux plugin in a standalone web page.",
   "repository": {
     "type": "git",

@@ -741,12 +741,21 @@ export class TmuxRuntime {
     const client = this.client
     if (client === null || !client.attached) throw new Error('not attached')
     if (msg.type === 'input') {
-      this.claimSizing(socket)
+      // Only a person typing here makes this page the sizer. Data a browser
+      // sends on its own (terminal replies) must never move the window, or
+      // two viewers answering the same query resize it back and forth forever.
+      if (msg.user === true) this.claimSizing(socket)
       await client.sendKeys(msg.pane, msg.data)
+      if (msg.user === true && this.sizePolicy() === 'primary') await this.queueSizePolicy()
+      return
+    }
+    if (msg.type === 'select') {
+      // A click or tap on a pane is the same intent as typing into it.
+      this.claimSizing(socket)
+      await client.selectPane(msg.pane)
       if (this.sizePolicy() === 'primary') await this.queueSizePolicy()
       return
     }
-    if (msg.type === 'select') { await client.selectPane(msg.pane); return }
     if (msg.type === 'swap') {
       if (
         typeof msg.pane !== 'string' || !/^%\d+$/.test(msg.pane)

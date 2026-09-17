@@ -162,7 +162,8 @@ export interface Snapshot {
 export type ClientToHost =
   | ManagementRequest
   | { type: 'hello' }
-  | { type: 'input'; pane: string; data: string }
+  /** `user`: produced by a gesture on that page (typing, key bar), not by its terminal answering a query. */
+  | { type: 'input'; pane: string; data: string; user?: boolean }
   | { type: 'resize'; cols: number; rows: number }
   | { type: 'resize'; active: false }
   | { type: 'select'; pane: string }
