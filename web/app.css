@@ -126,6 +126,40 @@ button { -webkit-tap-highlight-color: transparent; }
   outline: 2px solid var(--accent); outline-offset: 1px;
 }
 
+/* ---------- key bar: keys the on-screen keyboard lacks ---------- */
+/* Sits at the bottom of the shell, i.e. directly above the software
+   keyboard; shown only while a terminal is focused on a touch screen. */
+[data-tmux-cc-keys] {
+  display: none; flex: none; align-items: center; gap: 6px; height: 46px; box-sizing: border-box;
+  padding: 0 max(6px, env(safe-area-inset-right)) 0 max(6px, env(safe-area-inset-left));
+  background: var(--bg-2); border-top: 1px solid var(--line-1);
+  user-select: none; -webkit-user-select: none; touch-action: none;
+}
+[data-tmux-cc-shell][data-mobile="1"][data-kbd="1"] [data-tmux-cc-keys] { display: flex; }
+[data-tmux-cc-keys-row] {
+  display: flex; gap: 4px; flex: 1; min-width: 0; height: 100%; align-items: center;
+  overflow-x: auto; scrollbar-width: none; touch-action: pan-x;
+  mask-image: linear-gradient(to right, #000 calc(100% - 16px), transparent);
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 16px), transparent);
+  padding-right: 16px;
+}
+[data-tmux-cc-keys-row]::-webkit-scrollbar { display: none; }
+[data-tmux-cc-key], [data-tmux-cc-keys-hide] {
+  flex: none; height: 36px; min-width: 40px; padding: 0 8px; box-sizing: border-box;
+  border: none; border-radius: 8px; cursor: pointer;
+  background: var(--bg-3); color: var(--fg-1);
+  font: 500 15px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  display: inline-flex; align-items: center; justify-content: center;
+  box-shadow: 0 1px 0 var(--bg-0);
+  transition: background-color 80ms var(--ease), transform 80ms var(--ease);
+}
+[data-tmux-cc-key][data-down="1"], [data-tmux-cc-keys-hide][data-down="1"] { background: var(--line-2); transform: translateY(1px); box-shadow: none; }
+[data-tmux-cc-key]:active, [data-tmux-cc-keys-hide]:active { background: var(--line-2); transform: translateY(1px); box-shadow: none; }
+[data-tmux-cc-key][aria-pressed="true"] { background: var(--accent-strong); color: #fff; }
+[data-tmux-cc-key][data-locked="1"] { box-shadow: inset 0 -3px 0 #fff8; }
+[data-tmux-cc-keys-hide] { min-width: 44px; background: transparent; color: var(--fg-2); box-shadow: none; }
+[data-tmux-cc-keys-hide] svg { width: 20px; height: 20px; }
+
 /* ---------- notices ---------- */
 [data-tmux-cc-error] {
   flex: none; padding: 5px 12px; font-size: 12px;
@@ -354,6 +388,9 @@ button { -webkit-tap-highlight-color: transparent; }
   /* The toolbar owns Close pane on touch; a strip-sized button is not a target. */
   [data-tmux-cc-shell][data-mobile="1"] [data-tmux-cc-pclose] { display: none; }
   [data-tmux-cc-shell][data-mobile="1"] [data-tmux-cc-touch] { display: block; }
+  /* Text inside the terminal must not be selectable on tap: iOS turns a long
+     press into a selection loupe, stealing the gesture. */
+  [data-tmux-cc-shell][data-mobile="1"] .xterm-rows { -webkit-user-select: none; user-select: none; }
   /* xterm parks its focus textarea at left:-9999em. iOS insists on
      scrolling a newly-focused element into view, and with the document
      scroll-locked that reveal is impossible — Safari then refuses to show

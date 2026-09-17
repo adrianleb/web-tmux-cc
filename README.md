@@ -27,6 +27,8 @@ Reconnecting re-seeds each pane from `capture-pane`, restoring the cursor positi
 
 Output floods (a TUI re-rendering a long transcript after a resize, a `cat` of a large file) are not replayed. The server drains tmux's control channel at a bounded rate — slower while the browser still has unrendered output — so tmux's `pause-after` drops the flood's backlog for this client instead of holding the pane to the browser's pace; the pane then re-syncs from a short capture of its final screen. Panes run at full speed and a 20 MB burst costs the browser a couple of megabytes and no stall.
 
+On phones and tablets, tap a pane to type in it (dragging scrolls; a tap on a pane title only selects it, a double tap zooms). A key bar sits above the on-screen keyboard with Esc, Tab, arrows, Home/End, PgUp/PgDn and the symbols mobile keyboards hide; Ctrl and Alt are sticky — tap once for the next key, twice to lock — and apply to characters typed on the system keyboard as well. Opening the keyboard never resizes the tmux window (that would reflow every viewer twice per message); the page scrolls so the active pane's bottom rows stay above it.
+
 For a global installation, `npm install -g .` installs the `web-tmux-cc` executable, which starts the server directly. There are no subcommands. Hosting, HTTPS, and access control belong to your deployment, not this application.
 
 ## Release installation
@@ -34,7 +36,7 @@ For a global installation, `npm install -g .` installs the `web-tmux-cc` executa
 The [GitHub releases](https://github.com/adrianleb/web-tmux-cc/releases) include a prebuilt npm package. With Node.js 22.6+ and tmux installed:
 
 ```sh
-npm install -g https://github.com/adrianleb/web-tmux-cc/releases/download/v0.3.1/web-tmux-cc-0.3.1.tgz
+npm install -g https://github.com/adrianleb/web-tmux-cc/releases/download/v0.4.0/web-tmux-cc-0.4.0.tgz
 web-tmux-cc
 ```
 

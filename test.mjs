@@ -262,18 +262,35 @@ test('touch viewport, native Auto grid, Mirror policy, and startup splash regres
 
     // Playwright does not emulate a native software keyboard. Focus is real;
     // its visualViewport resize/pan is deterministic and restored afterward.
+    // The keyboard never resizes the tmux window: the shell follows the
+    // visual viewport, the key bar appears, and the canvas scrolls so the
+    // active pane's bottom rows stay above the keyboard.
+    const keys = page.locator('[data-tmux-cc-keys]')
+    await expect(keys).toBeHidden()
     await page.locator('[data-tmux-cc-kbd]').click()
     await expect(page.locator('.xterm-helper-textarea')).toBeFocused()
+    await expect(keys).toBeVisible()
+    const reportsBeforeKeyboard = reports.length
     await page.evaluate(() => window.testVisualViewport({ width: 1180, height: 490, offsetLeft: 0, offsetTop: 24, scale: 1 }))
-    const keyboard = await autoGrid()
-    assert.equal(keyboard.cols, landscape.cols)
-    assert.ok(keyboard.rows < landscape.rows, 'keyboard shrinks native rows at tablet width')
-    assert.deepEqual(await page.evaluate(() => [innerWidth, innerHeight]), [1180, 820], 'layout viewport did not resize')
     await checkChrome(1180, 490, 24)
+    assert.deepEqual(await page.evaluate(() => [innerWidth, innerHeight]), [1180, 820], 'layout viewport did not resize')
+    await page.waitForTimeout(1200)
+    assert.deepEqual(await nativeGrid(), landscape, 'the on-screen keyboard does not resize the tmux window')
+    assert.equal(reports.length, reportsBeforeKeyboard, 'no grid report for the keyboard')
+    const reveal = await page.evaluate(() => {
+      const body = document.querySelector('[data-tmux-cc-body]')
+      const active = document.querySelector('[data-tmux-cc-pane][data-active="1"]')
+      const keysBox = document.querySelector('[data-tmux-cc-keys]').getBoundingClientRect()
+      const shellBox = document.querySelector('[data-tmux-cc-shell]').getBoundingClientRect()
+      return { paneBottomVisible: active.offsetTop + active.offsetHeight <= body.scrollTop + body.clientHeight + 1, keysAtShellBottom: Math.abs(keysBox.bottom - shellBox.bottom) <= 1 }
+    })
+    assert.deepEqual(reveal, { paneBottomVisible: true, keysAtShellBottom: true })
     await screenshot('keyboard')
-    await page.locator('[data-tmux-cc-kbd]').click()
+    await page.locator('[data-tmux-cc-keys-hide]').click()
+    await expect(page.locator('.xterm-helper-textarea')).not.toBeFocused()
+    await expect(keys).toBeHidden()
     await page.evaluate(() => window.testVisualViewport(null))
-    assert.deepEqual(await autoGrid(), landscape, 'native grid recovers after the keyboard closes')
+    assert.deepEqual(await autoGrid(), landscape, 'native grid unchanged after the keyboard closes')
     await checkChrome(1180, 820)
 
     const cdp = browserType === chromium ? await context.newCDPSession(page) : null
@@ -594,6 +611,72 @@ test('an output flood pauses the pane instead of replaying it and re-syncs to th
     await page.keyboard.press('Enter')
     await expect.poll(() => page.locator('.xterm-rows').innerText(), { timeout: 15000 }).toContain('AFTER-FLOOD')
     assert.ok(outputs > 0, 'live output resumed after the pause')
+    assert.deepEqual(errors, [])
+  } finally {
+    if (browser) await browser.close()
+    if (app) await app.close()
+    await native('kill-server').catch(() => {})
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('on a phone, tapping a pane focuses it and the key bar sends the keys the on-screen keyboard lacks', { timeout: 60000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'web-tmux-keys-test-'))
+  const socket = `web-tmux-keys-test-${randomUUID()}`
+  const binary = process.env.TMUX_TEST_BIN || 'tmux'
+  const native = (...args) => exec(binary, ['-L', socket, '-f', '/dev/null', ...args])
+  const wrapper = join(dir, 'tmux')
+  const quote = value => `'${value.replaceAll("'", "'\\''")}'`
+  await writeFile(wrapper, `#!/bin/sh\nexec ${quote(binary)} -L ${quote(socket)} -f /dev/null "$@"\n`, { mode: 0o755 })
+  let app, browser
+  try {
+    // cat -v echoes control bytes visibly: the pane shows exactly what arrived.
+    await native('new-session', '-d', '-s', 'keys', '-x', '100', '-y', '30', 'cat -v')
+    await native('split-window', '-t', 'keys', '-v', 'cat -v')
+    app = await startServer({ port: 0, tmuxBin: wrapper, settingsFile: join(dir, 'settings.json') })
+    browser = await browserType.launch({ headless: true })
+    const context = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true })
+    const page = await context.newPage()
+    const errors = []
+    page.on('pageerror', error => errors.push(error.message))
+    await page.goto(app.url + '?session=keys')
+    await expect(page.locator('.xterm')).toHaveCount(2)
+    const keys = page.locator('[data-tmux-cc-keys]')
+    await expect(keys).toBeHidden()
+    const lower = (await native('list-panes', '-t', 'keys', '-F', '#{pane_id}')).stdout.trim().split('\n')[1]
+    // A tap on a pane's surface selects it and brings up the keyboard.
+    await page.locator(`[data-pane-id="${lower}"] [data-tmux-cc-touch]`).tap()
+    await expect(page.locator('.xterm-helper-textarea').nth(1)).toBeFocused()
+    await expect(page.locator(`[data-pane-id="${lower}"]`)).toHaveAttribute('data-active', '1')
+    await expect(keys).toBeVisible()
+    const key = async name => {
+      await page.evaluate(n => document.querySelector(`[data-tmux-cc-key="${n}"]`).scrollIntoView({ inline: 'center' }), name)
+      await page.locator(`[data-tmux-cc-key="${name}"]`).tap()
+    }
+    const ctrl = page.locator('[data-tmux-cc-key="ctrl"]')
+    await key('esc')
+    await key('ctrl')
+    await expect(ctrl).toHaveAttribute('aria-pressed', 'true')
+    await page.keyboard.type('a')                       // sticky: one key, then released
+    await expect(ctrl).toHaveAttribute('aria-pressed', 'false')
+    await key('↑')
+    await key('ctrl'); await key('→')                   // modifier applies to bar keys too
+    await key('alt'); await page.keyboard.type('x')
+    await key('ctrl'); await key('ctrl')                // second tap locks
+    await expect(ctrl).toHaveAttribute('data-locked', '1')
+    await page.keyboard.type('ab')
+    await key('ctrl')                                   // third tap releases the lock
+    await expect(ctrl).toHaveAttribute('aria-pressed', 'false')
+    await page.keyboard.type('z')
+    await key('~')
+    await page.keyboard.press('Enter')
+    await expect.poll(async () => (await native('capture-pane', '-p', '-t', lower)).stdout, { timeout: 15000 })
+      .toContain('^[^A^[[A^[[1;5C^[x^A^Bz~')
+    // Key bar taps never steal focus from the terminal; the hide button releases it.
+    await expect(page.locator('.xterm-helper-textarea').nth(1)).toBeFocused()
+    await page.locator('[data-tmux-cc-keys-hide]').tap()
+    await expect(page.locator('.xterm-helper-textarea').nth(1)).not.toBeFocused()
+    await expect(keys).toBeHidden()
     assert.deepEqual(errors, [])
   } finally {
     if (browser) await browser.close()
