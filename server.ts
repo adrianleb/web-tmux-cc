@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { createServer } from 'node:http'
+import { createHash } from 'node:crypto'
 import { readFile, writeFile, mkdir, realpath } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
@@ -13,17 +14,19 @@ export async function startServer({
   tmuxBin = process.env.TMUX_BIN || 'tmux',
   settingsFile = process.env.SETTINGS_FILE || join(homedir(), '.config', 'web-tmux-cc.json'),
 } = {}) {
-  let sizePolicy: 'auto' | 'mirror' = 'auto'
+  let sizePolicy: 'primary' | 'auto' | 'mirror' = 'primary'
   try {
     const settings = JSON.parse(await readFile(settingsFile, 'utf8'))
-    if (settings.sizePolicy === 'mirror') sizePolicy = 'mirror'
+    if (settings.sizePolicy === 'primary' || settings.sizePolicy === 'auto' || settings.sizePolicy === 'mirror') sizePolicy = settings.sizePolicy
   } catch (error) { if (error.code !== 'ENOENT') throw error }
   const runtimes = new Set<TmuxRuntime>()
   const web = new URL('./web/', import.meta.url)
   const mime = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.webmanifest': 'application/manifest+json' }
-  const assets = new Map<string, { data: Buffer; type: string }>()
+  const assets = new Map<string, { data: Buffer; type: string; etag: string }>()
   for (const file of ['index.html', 'app.js', 'app.css', 'manifest.webmanifest', 'icon.svg', 'vendor/xterm.js', 'vendor/xterm.css']) {
-    assets.set(file.split('/').at(-1)!, { data: await readFile(new URL(file, web)), type: mime[file.slice(file.lastIndexOf('.'))] })
+    const data = await readFile(new URL(file, web))
+    const etag = `"${createHash('sha1').update(data).digest('base64url')}"`
+    assets.set(file.split('/').at(-1)!, { data, type: mime[file.slice(file.lastIndexOf('.'))], etag })
   }
   const server = createServer(async (req, res) => {
     try {
@@ -34,7 +37,7 @@ export async function startServer({
           let body = ''
           for await (const chunk of req) body += chunk
           const next = JSON.parse(body).sizePolicy
-          if (next !== 'auto' && next !== 'mirror') throw new Error('Expected sizePolicy: auto or mirror')
+          if (next !== 'primary' && next !== 'auto' && next !== 'mirror') throw new Error('Expected sizePolicy: primary, auto or mirror')
           await mkdir(dirname(settingsFile), { recursive: true })
           await writeFile(settingsFile, JSON.stringify({ sizePolicy: next }) + '\n')
           sizePolicy = next
@@ -50,7 +53,9 @@ export async function startServer({
         res.writeHead(302, { Location: path + '/' + url.search }); res.end(); return
       }
       if (!asset) { res.writeHead(404); res.end('Not found'); return }
-      res.writeHead(200, { 'Content-Type': asset.type })
+      // Deployments replace the bundle in place: always revalidate, never serve a stale build.
+      if (req.headers['if-none-match'] === asset.etag) { res.writeHead(304, { ETag: asset.etag, 'Cache-Control': 'no-cache' }); res.end(); return }
+      res.writeHead(200, { 'Content-Type': asset.type, ETag: asset.etag, 'Cache-Control': 'no-cache' })
       res.end(req.method === 'HEAD' ? undefined : asset.data)
     } catch (error) { res.writeHead(400); res.end(error.message) }
   })

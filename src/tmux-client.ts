@@ -4,7 +4,6 @@ import { decodeControlOutput } from './decode.ts'
 import { parseLayout, type PaneRect } from './layout.ts'
 import type { SessionInfo, WindowInfo } from './types.ts'
 
-import { listSessionsCli } from './tmux-cli.ts'
 export { listSessionsCli } from './tmux-cli.ts'
 
 export interface TmuxPane {
@@ -50,6 +49,10 @@ export type SpawnTransport = (tmuxBin: string, args: string[]) => ControlTranspo
 interface Pending {
   line: string
   settled: boolean
+  /** Reply blocks still expected: tmux answers each `;`-chained command with its own block. */
+  remaining: number
+  parts: string[]
+  failure: Error | null
   resolve: (text: string) => void
   reject: (err: Error) => void
   timer: ReturnType<typeof setTimeout>
@@ -85,7 +88,6 @@ export function normalizeHistoryLines(value: unknown): number {
 
 export interface TmuxControlOptions {
   spawnTransport?: SpawnTransport
-  listSessions?: (tmuxBin: string) => Promise<SessionInfo[]>
   /** Per-command reply timeout; a timed-out command fails without wedging the queue. */
   commandTimeoutMs?: number
 }
@@ -106,14 +108,12 @@ export class TmuxControlClient extends EventEmitter<Events> {
   private processingInput = false
   readonly tmuxBin: string
   private readonly spawnTransport: SpawnTransport
-  private readonly listSessions: (tmuxBin: string) => Promise<SessionInfo[]>
   private readonly commandTimeoutMs: number
 
   constructor(tmuxBin = 'tmux', options: TmuxControlOptions = {}) {
     super()
     this.tmuxBin = tmuxBin
     this.spawnTransport = options.spawnTransport ?? defaultTransport
-    this.listSessions = options.listSessions ?? listSessionsCli
     this.commandTimeoutMs = options.commandTimeoutMs ?? 5000
   }
 
@@ -238,12 +238,22 @@ export class TmuxControlClient extends EventEmitter<Events> {
     const panes = paneId === undefined ? visible : visible.filter((pane) => pane.id === paneId)
     const captures: HistoryCapture[] = []
     for (const pane of panes) {
-      const text = await this.command(`capture-pane -epJ -t ${quote(pane.id)} -S -${historyLines}`)
-      const lines = text.split('\n')
-      while (lines.length > 0 && lines[lines.length - 1].trim() === '') lines.pop()
-      if (lines.length === 0) continue
-      const data = truncateHistory(`${lines.join('\r\n')}\r\n`)
-      if (data !== '') captures.push({ pane: pane.id, data })
+      const target = quote(pane.id)
+      // One round trip per pane: mode flags, then the capture whose flags
+      // depend on them (`-J` joins wrapped lines only for the normal buffer;
+      // the alternate screen is captured row-exact). `if-shell -F` picks
+      // inside tmux and answers in a third block.
+      const raw = await this.command([
+        `display-message -p -t ${target} -F ${quote(`M\t${PANE_SEED_FORMAT}`)}`,
+        `if-shell -F -t ${target} '#{alternate_on}' "capture-pane -ep -t ${target} -S -${historyLines}" "capture-pane -epJ -t ${target} -S -${historyLines}"`,
+      ].join(' ; '), 3)
+      const lines = raw.split('\n')
+      const marker = lines.findIndex((line) => line.startsWith('M\t'))
+      if (marker < 0) continue
+      const state = parsePaneSeedState(lines[marker]!.slice(2))
+      const body = truncateHistory(lines.slice(marker + 1).join('\r\n'))
+      if (body === '' && !state.alternateOn) continue
+      captures.push({ pane: pane.id, data: formatHistorySeed(body, state) })
     }
     return captures
   }
@@ -320,6 +330,17 @@ export class TmuxControlClient extends EventEmitter<Events> {
     await this.command(`refresh-client -C ${c}x${r}`)
   }
 
+  /** Force a window to a grid; sets that window's `window-size` to `manual`. */
+  async resizeWindow(windowId: string, cols: number, rows: number): Promise<void> {
+    const { cols: c, rows: r } = clampClientSize(cols, rows)
+    await this.command(`resize-window -t ${quote(windowId)} -x ${c} -y ${r}`)
+  }
+
+  /** Drop a window's manual `window-size` so tmux recalculates from remaining clients. */
+  async unsetWindowSize(windowId: string): Promise<void> {
+    await this.command(`set-option -wu -t ${quote(windowId)} window-size`)
+  }
+
   async resizePane(paneId: string, opts: { width?: number; height?: number }): Promise<void> {
     if (opts.width !== undefined) {
       await this.command(`resize-pane -t ${quote(paneId)} -x ${Math.max(4, Math.floor(opts.width))}`)
@@ -349,34 +370,50 @@ export class TmuxControlClient extends EventEmitter<Events> {
     return task
   }
 
+  /**
+   * One control round trip for the whole snapshot: tmux runs a `;`-chained
+   * command list inside a single reply block, so every line is tagged with a
+   * leading letter to say which command produced it. The tmux server is
+   * often remote-ish (ssh wrappers, slow hosts), and refreshes fire on every
+   * layout change, so the command count is the latency.
+   */
   private async readSnapshot(transport: ControlTransport): Promise<TmuxSnapshot> {
-    const win = await this.command(
-      "display-message -p -F '#{window_id}\t#{window_name}\t#{window_width}\t#{window_height}\t#{window_visible_layout}\t#{window_zoomed_flag}\t#{session_name}'",
-    )
-    const [windowId, windowName, w, h, visibleLayout, zoomedFlag, sessionName] = win.split('\t')
+    const raw = await this.command([
+      "display-message -p -F 'W\t#{window_id}\t#{window_name}\t#{window_width}\t#{window_height}\t#{window_visible_layout}\t#{window_zoomed_flag}\t#{session_name}'",
+      "list-panes -F 'P\t#{pane_id}\t#{pane_index}\t#{pane_title}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_active}\t#{@dsh_role}'",
+      "list-windows -F 'X\t#{window_id}\t#{window_index}\t#{window_name}\t#{window_active}'",
+      "list-sessions -F 'S\t#{session_name}\t#{session_attached}\t#{session_windows}'",
+      "list-clients -F 'C\t#{client_name}\t#{client_session}\t#{client_flags}'",
+    ].join(' ; '), 5)
+    const tagged: Record<string, string[]> = { W: [], P: [], X: [], S: [], C: [] }
+    for (const line of raw.split('\n')) {
+      const tag = line.slice(0, 2)
+      if (tag.length === 2 && tag[1] === '\t' && tag[0] in tagged) tagged[tag[0]]!.push(line.slice(2))
+    }
+    const [windowId, windowName, w, h, visibleLayout, zoomedFlag, sessionName] = (tagged.W[0] ?? '').split('\t')
     if (sessionName) this.sessionName = sessionName
-    const list = await this.command(
-      "list-panes -F '#{pane_id}\t#{pane_index}\t#{pane_title}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_active}\t#{@dsh_role}'",
-    )
-    const windowsRaw = await this.command(
-      "list-windows -F '#{window_id}\t#{window_index}\t#{window_name}\t#{window_active}'",
-    )
-    const sessions = await this.listSessions(this.tmuxBin)
-    // Viewer detection grants sizing authority, so every failure must fail
-    // closed. Reusing an earlier zero could resize a client that attached after
-    // that snapshot but before this refresh.
-    const viewers = await this.countViewers().catch(() => 1)
-    const fromList = list.trim() === '' ? [] : list.trim().split('\n').map(parsePaneLine)
+    const fromList = tagged.P.map(parsePaneLine)
     const zoomed = zoomedFlag === '1'
     // tmux keeps reporting hidden panes with their pre-zoom coordinates. The
     // visible layout is authoritative: in zoom mode only the active pane is
     // actually on screen, occupying the full window.
     const visiblePanes = zoomed ? fromList.filter((pane) => pane.active) : fromList
     const panes = mergePanes(visiblePanes, safeParse(visibleLayout ?? ''))
-    const windows: WindowInfo[] = windowsRaw.trim() === '' ? [] : windowsRaw.trim().split('\n').map((line) => {
+    const windows: WindowInfo[] = tagged.X.map((line) => {
       const [id, index, name, active] = line.split('\t')
       return { id: id ?? '', index: Number(index) || 0, name: name ?? '', active: active === '1' }
     })
+    const sessions: SessionInfo[] = tagged.S.map((line) => {
+      const [name, attached, count] = line.split('\t')
+      return { name: name ?? '', attached: Number(attached) || 0, windows: Number(count) || 0 }
+    })
+    // Viewer detection grants sizing authority under Auto, so it is read in
+    // the same block as the layout it authorises: no client can slip in
+    // between the two.
+    const viewers = tagged.C.filter((line) => {
+      const [name, session, flags] = line.split('\t')
+      return name !== this.clientName && session === this.sessionName && !(flags ?? '').split(',').includes('ignore-size')
+    }).length
     const snap: TmuxSnapshot = {
       session: this.sessionName,
       windowId: windowId ?? '',
@@ -413,25 +450,33 @@ export class TmuxControlClient extends EventEmitter<Events> {
     }, 80)
   }
 
-  private command(line: string): Promise<string> {
+  /**
+   * Send one control line and collect its reply. A `;`-chained line yields
+   * one block per command (plus one per command a `if-shell` inserts), so
+   * callers pass how many blocks to gather; the parts are joined with `\n`.
+   */
+  private command(line: string, blocks = 1): Promise<string> {
     const transport = this.transport
     if (transport === null) return Promise.reject(new Error('not attached'))
-    return new Promise((resolve, reject) => {
-      const pending: Pending = {
-        line,
-        settled: false,
-        resolve,
-        reject,
-        // A timed-out command fails alone; its queue slot stays so the
-        // FIFO reply pairing keeps its alignment if the reply is just late.
-        timer: setTimeout(() => {
-          pending.settled = true
-          reject(new Error(`tmux command timed out: ${line.split(' ')[0]}`))
-        }, this.commandTimeoutMs),
-      }
-      this.queue.push(pending)
-      transport.write(`${line}\n`)
-    })
+    const { promise, resolve, reject } = Promise.withResolvers<string>()
+    const pending: Pending = {
+      line,
+      settled: false,
+      remaining: blocks,
+      parts: [],
+      failure: null,
+      resolve,
+      reject,
+      // A timed-out command fails alone; its queue slot stays so the
+      // FIFO reply pairing keeps its alignment if the reply is just late.
+      timer: setTimeout(() => {
+        pending.settled = true
+        reject(new Error(`tmux command timed out: ${line.split(' ')[0]}`))
+      }, this.commandTimeoutMs),
+    }
+    this.queue.push(pending)
+    transport.write(`${line}\n`)
+    return promise
   }
 
   private settle(pending: Pending, err: Error | null, text: string): void {
@@ -535,13 +580,18 @@ export class TmuxControlClient extends EventEmitter<Events> {
       if (isError && text.trim() !== '') this.emit('error', text.trim())
       return
     }
-    const pending = this.queue.shift()
+    const pending = this.queue[0]
     if (pending === undefined) {
       if (isError && text.trim() !== '') this.emit('error', text.trim())
       return
     }
-    if (isError) this.settle(pending, new Error(text.trim() || 'tmux error'), '')
-    else this.settle(pending, null, text)
+    if (isError) pending.failure ??= new Error(text.trim() || 'tmux error')
+    else pending.parts.push(text)
+    pending.remaining -= 1
+    if (pending.remaining > 0) return
+    this.queue.shift()
+    if (pending.failure) this.settle(pending, pending.failure, '')
+    else this.settle(pending, null, pending.parts.join('\n'))
   }
 }
 
@@ -605,6 +655,63 @@ function truncateHistory(data: string): string {
   const newline = tail.indexOf(0x0a)
   if (newline >= 0) tail = tail.subarray(newline + 1)
   return tail.toString('utf8').replace(/^\uFFFD+/, '')
+}
+
+const PANE_SEED_FORMAT = [
+  '#{alternate_on}',
+  '#{cursor_x}',
+  '#{cursor_y}',
+  '#{cursor_flag}',
+  '#{mouse_any_flag}',
+  '#{mouse_button_flag}',
+  '#{mouse_standard_flag}',
+  '#{mouse_sgr_flag}',
+  '#{mouse_utf8_flag}',
+  '#{keypad_cursor_flag}',
+  '#{keypad_flag}',
+  '#{wrap_flag}',
+  '#{insert_flag}',
+  '#{origin_flag}',
+].join('\t')
+
+interface PaneSeedState {
+  alternateOn: boolean
+  cursorX: number
+  cursorY: number
+  modes: string
+}
+
+function parsePaneSeedState(raw: string): PaneSeedState {
+  const fields = (raw.split('\n')[0] ?? '').split('\t')
+  const num = (i: number): number => Number.parseInt(fields[i] ?? '', 10)
+  const on = (i: number): boolean => {
+    const value = num(i)
+    return Number.isFinite(value) && value !== 0
+  }
+  let modes = ''
+  if (fields[3] === '0') modes += '\x1b[?25l'
+  if (on(4)) modes += '\x1b[?1003h'
+  if (on(5)) modes += '\x1b[?1002h'
+  if (on(6)) modes += '\x1b[?1000h'
+  if (on(7)) modes += '\x1b[?1006h'
+  if (on(8)) modes += '\x1b[?1005h'
+  if (on(9)) modes += '\x1b[?1h'
+  if (on(10)) modes += '\x1b='
+  if (fields[11] === '0') modes += '\x1b[?7l'
+  if (on(12)) modes += '\x1b[4h'
+  if (on(13)) modes += '\x1b[?6h'
+  return { alternateOn: on(0), cursorX: num(1), cursorY: num(2), modes }
+}
+
+function formatHistorySeed(body: string, state: PaneSeedState): string {
+  let data = '\x1b)0'
+  if (state.alternateOn) data += '\x1b[?1049h'
+  data += body
+  data += '\x0f'
+  if (Number.isFinite(state.cursorX) && Number.isFinite(state.cursorY)) {
+    data += `\x1b[${state.cursorY + 1};${state.cursorX + 1}H`
+  }
+  return data + state.modes
 }
 
 function quote(value: string): string {

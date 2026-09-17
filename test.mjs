@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { execFile } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
 import { mkdtemp, writeFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -160,15 +160,16 @@ test('touch viewport, native Auto grid, Mirror policy, and startup splash regres
       const [cols, rows] = stdout.trim().split(' ').map(Number)
       return { cols, rows }
     }
-    const expectedGrid = (fontSize = 12, stacks = 1) => page.evaluate(({ fontSize, stacks }) => {
+    // Pane titles occupy tmux's separator rows, so the window grid depends
+    // only on the page and the font: one extra row for the topmost titles.
+    const expectedGrid = (fontSize = 12) => page.evaluate(({ fontSize }) => {
       const body = document.querySelector('[data-tmux-cc-body]').getBoundingClientRect()
-      const title = document.querySelector('[data-tmux-cc-ptitle]').getBoundingClientRect()
       const canvas = document.createElement('canvas').getContext('2d')
       canvas.font = `${fontSize}px monospace`
       const cell = canvas.measureText('W')
       const height = Math.ceil((cell.fontBoundingBoxAscent + cell.fontBoundingBoxDescent) * devicePixelRatio) / devicePixelRatio
-      return { cols: Math.floor(body.width / cell.width), rows: Math.floor((body.height - title.height * stacks) / height) }
-    }, { fontSize, stacks })
+      return { cols: Math.floor(body.width / cell.width), rows: Math.floor(body.height / height) - 1 }
+    }, { fontSize })
     const fittedPanes = async () => {
       const { stdout } = await native('list-panes', '-t', 'tablet', '-F', '#{pane_id} #{pane_height}')
       const rows = Object.fromEntries(stdout.trim().split('\n').map(line => line.split(' ')))
@@ -191,7 +192,7 @@ test('touch viewport, native Auto grid, Mirror policy, and startup splash regres
         return failures
       }), rows)
     }
-    const autoGrid = async (fontSize = 12, stacks = 1) => {
+    const autoGrid = async (fontSize = 12) => {
       // setViewportSize resolves before the visualViewport event is painted.
       // Do not accidentally accept the previous orientation's settled grid.
       const viewport = await page.evaluate(() => ({
@@ -203,7 +204,7 @@ test('touch viewport, native Auto grid, Mirror policy, and startup splash regres
         return { width, height }
       }).toEqual(viewport)
       await expect(shell).toHaveAttribute('data-size-mode', 'takeover')
-      const expected = await expectedGrid(fontSize, stacks)
+      const expected = await expectedGrid(fontSize)
       await expect.poll(async () => ({ report: reports.at(-1), native: await nativeGrid() }), { timeout: 10000 })
         .toEqual({ report: expected, native: expected })
       await expect.poll(fittedPanes).toEqual([])
@@ -217,11 +218,12 @@ test('touch viewport, native Auto grid, Mirror policy, and startup splash regres
         return Object.fromEntries(Object.entries(box).map(([key, value]) => [key, Math.round(value)]))
       }).toEqual({ x: 0, y, width, height })
       await expect(header).toHaveCount(1)
-      const boxes = await Promise.all([header, header.locator('strong'), bar, settings].map(node => node.boundingBox()))
+      const brand = header.locator('[data-tmux-cc-brand]')
+      const boxes = await Promise.all([header, brand, bar, settings].map(node => node.boundingBox()))
       const centers = boxes.slice(1).map(box => box.y + box.height / 2)
-      assert.ok(Math.max(...centers) - Math.min(...centers) <= 1, 'title, controls, and settings share a single row')
+      assert.ok(Math.max(...centers) - Math.min(...centers) <= 1, 'brand, controls, and settings share a single row')
       assert.equal(boxes[0].height, initialHeader, 'header height is stable across rotation/keyboard/breakpoint')
-      await expect(header.locator('strong')).toBeInViewport()
+      await expect(brand).toBeInViewport()
       await expect(settings).toBeInViewport()
       // Narrow layouts intentionally scroll the bar: every control must remain
       // reachable, without pushing the title/settings off-screen or wrapping.
@@ -321,9 +323,9 @@ test('touch viewport, native Auto grid, Mirror policy, and startup splash regres
     assert.deepEqual(await autoGrid(), landscape)
     await page.locator('[data-tmux-cc-split-v]').click()
     await expect(page.locator('.xterm')).toHaveCount(2)
-    const splitGrid = await autoGrid(12, 2)
-    assert.equal(splitGrid.cols, landscape.cols)
-    assert.ok(splitGrid.rows < landscape.rows, 'stacked pane titles are excluded from native row capacity')
+    assert.deepEqual(await autoGrid(), landscape, 'splitting never resizes the native window')
+    const fontSizes = await page.locator('[data-tmux-cc-pane] .xterm-rows > div:first-child').evaluateAll(rows => [...new Set(rows.map(row => getComputedStyle(row).fontSize))])
+    assert.equal(fontSizes.length, 1, `every pane of an uneven split renders at the same font size (${fontSizes.join(', ')})`)
     await page.locator('[data-tmux-cc-zoom]').click()
     await expect.poll(async () => (await native('display-message', '-p', '-t', 'tablet', '#{window_zoomed_flag}')).stdout.trim()).toBe('1')
     await expect(page.locator('.xterm')).toHaveCount(1)
@@ -331,7 +333,7 @@ test('touch viewport, native Auto grid, Mirror policy, and startup splash regres
     await page.locator('[data-tmux-cc-zoom]').click()
     await expect.poll(async () => (await native('display-message', '-p', '-t', 'tablet', '#{window_zoomed_flag}')).stdout.trim()).toBe('0')
     await expect(page.locator('.xterm')).toHaveCount(2)
-    assert.deepEqual(await autoGrid(12, 2), splitGrid)
+    assert.deepEqual(await autoGrid(), landscape)
 
     await settings.click()
     const policy = page.getByLabel(/^Window sizing policy/)
@@ -345,7 +347,7 @@ test('touch viewport, native Auto grid, Mirror policy, and startup splash regres
     const mirrored = await nativeGrid()
     await page.setViewportSize({ width: 820, height: 1180 })
     await checkChrome(820, 1180)
-    const mirrorReport = await expectedGrid(12, 2)
+    const mirrorReport = await expectedGrid()
     assert.notDeepEqual(mirrorReport, mirrored)
     await expect.poll(() => reports.at(-1)).toEqual(mirrorReport)
     await page.waitForTimeout(1200)
@@ -364,6 +366,179 @@ test('touch viewport, native Auto grid, Mirror policy, and startup splash regres
     assert.deepEqual(errors, [])
   } finally {
     releaseBundle?.()
+    if (browser) await browser.close()
+    if (app) await app.close()
+    await native('kill-server').catch(() => {})
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('history seed restores charset, cursor, and modes', { timeout: 60000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'web-tmux-seed-test-'))
+  const socket = `web-tmux-seed-test-${randomUUID()}`
+  const binary = process.env.TMUX_TEST_BIN || 'tmux'
+  const native = (...args) => exec(binary, ['-L', socket, '-f', '/dev/null', ...args])
+  const wrapper = join(dir, 'tmux')
+  const quote = value => `'${value.replaceAll("'", "'\\''")}'`
+  await writeFile(wrapper, `#!/bin/sh\nexec ${quote(binary)} -L ${quote(socket)} -f /dev/null "$@"\n`, { mode: 0o755 })
+  let app, browser
+  try {
+    // The page resizes the window on attach and readline redraws its line on
+    // SIGWINCH, so the prompt must be the real PS1, not printf'd text.
+    await native('new-session', '-d', '-s', 'seed', '-x', '80', '-y', '24', 'sh')
+    await native('send-keys', '-t', 'seed', "PS1='PROMPT> '", 'Enter')
+    await native('send-keys', '-t', 'seed', String.raw`clear; printf '\033(0lqqk\033(B\n'`, 'Enter')
+    await expect.poll(async () => (await native('capture-pane', '-p', '-t', 'seed')).stdout, { timeout: 15000 }).toContain('PROMPT>')
+    app = await startServer({ port: 0, tmuxBin: wrapper, settingsFile: join(dir, 'settings.json') })
+    browser = await browserType.launch({ headless: true })
+    const context = await browser.newContext({ viewport: { width: 1280, height: 800 } })
+    const page = await context.newPage()
+    const errors = []
+    page.on('pageerror', error => errors.push(error.message))
+    const historyData = []
+    page.on('websocket', ws => {
+      ws.on('framereceived', frame => {
+        if (typeof frame.payload !== 'string') return
+        try {
+          const msg = JSON.parse(frame.payload)
+          if (msg.type === 'history') historyData.push(msg.data)
+        } catch { /* ignore non-json frames */ }
+      })
+    })
+    await page.goto(app.url + '?session=seed')
+    await expect(page.locator('.xterm')).toHaveCount(1)
+    await expect.poll(async () => page.locator('.xterm-rows').innerText(), { timeout: 15000 }).toContain('PROMPT>')
+    historyData.length = 0
+    await page.reload()
+    await expect(page.locator('.xterm')).toHaveCount(1)
+    await expect.poll(async () => page.evaluate(() => document.querySelector('.xterm-rows')?.innerText || ''), { timeout: 15000 }).toContain('┌──┐')
+    const seeded = await page.evaluate(() => document.querySelector('.xterm-rows')?.innerText || '')
+    assert.ok(seeded.includes('┌──┐'), `box-drawing should render as glyphs, got ${JSON.stringify(seeded)}`)
+    await page.locator('.xterm').click()
+    await page.keyboard.type('ZZZ')
+    await expect.poll(async () => page.evaluate(() => {
+      const rows = [...document.querySelectorAll('.xterm-rows > div')].map(el => (el.textContent || '').replace(/\u00a0/g, ' '))
+      return [...rows].reverse().find(row => row.includes('PROMPT>') && !row.includes('printf')) || ''
+    }), { timeout: 15000 }).toContain('ZZZ')
+    await native('send-keys', '-t', 'seed', 'C-c')
+    await native('send-keys', '-t', 'seed', String.raw`printf '\033[?1049h\033[H\033[2JALT-SCREEN'`, 'Enter')
+    await expect.poll(async () => (await native('display-message', '-p', '-t', 'seed', '#{alternate_on}')).stdout.trim(), { timeout: 15000 }).toBe('1')
+    historyData.length = 0
+    await page.reload()
+    await expect(page.locator('.xterm')).toHaveCount(1)
+    await expect.poll(async () => page.evaluate(() => document.querySelector('.xterm-rows')?.innerText || ''), { timeout: 15000 }).toContain('ALT-SCREEN')
+    await expect.poll(() => historyData.find(data => data.includes('\u001b[?1049h')) || '', { timeout: 15000 }).toContain('\u001b)0')
+    const altSeed = historyData.find(data => data.includes('\u001b[?1049h'))
+    assert.ok(altSeed, 'history seed should restore the alternate screen')
+    assert.ok(altSeed.includes('\u001b)0'), 'history seed should designate G1 as DEC special graphics')
+    assert.match(altSeed, /\u001b\[\d+;\d+H/, 'history seed should CUP to the tmux cursor')
+    assert.deepEqual(errors, [])
+  } finally {
+    if (browser) await browser.close()
+    if (app) await app.close()
+    await native('kill-server').catch(() => {})
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('primary sizing overrides other sizing clients and hands back on detach', { timeout: 60000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'web-tmux-primary-test-'))
+  const socket = `web-tmux-primary-test-${randomUUID()}`
+  const binary = process.env.TMUX_TEST_BIN || 'tmux'
+  const native = (...args) => exec(binary, ['-L', socket, '-f', '/dev/null', ...args])
+  const wrapper = join(dir, 'tmux')
+  const quote = value => `'${value.replaceAll("'", "'\\''")}'`
+  await writeFile(wrapper, `#!/bin/sh\nexec ${quote(binary)} -L ${quote(socket)} -f /dev/null "$@"\n`, { mode: 0o755 })
+  let app, browser, competitor
+  try {
+    await native('new-session', '-d', '-s', 'prime', '-x', '100', '-y', '30', 'cat')
+    competitor = spawn(binary, ['-L', socket, '-f', '/dev/null', '-C', 'attach', '-t', 'prime'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    competitor.stdout.resume()
+    competitor.stderr.resume()
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('competitor failed to attach')), 5000)
+      const onExit = (code, signal) => {
+        clearTimeout(timer)
+        reject(new Error(`competitor exited ${code ?? signal}`))
+      }
+      competitor.once('error', err => { clearTimeout(timer); reject(err) })
+      competitor.once('exit', onExit)
+      const poll = async () => {
+        try {
+          const { stdout } = await native('list-clients', '-t', 'prime')
+          if (stdout.trim()) {
+            competitor.off('exit', onExit)
+            clearTimeout(timer)
+            resolve()
+            return
+          }
+        } catch { /* not yet */ }
+        setTimeout(poll, 50)
+      }
+      poll()
+    })
+    competitor.stdin.write('refresh-client -C 100x30\n')
+    await new Promise(resolve => setTimeout(resolve, 200))
+
+    app = await startServer({ port: 0, tmuxBin: wrapper, settingsFile: join(dir, 'settings.json') })
+    browser = await browserType.launch({ headless: true })
+    const context = await browser.newContext({ viewport: { width: 1280, height: 800 } })
+    const page = await context.newPage()
+    const errors = []
+    const reports = []
+    page.on('pageerror', error => errors.push(error.message))
+    page.on('websocket', ws => ws.on('framesent', ({ payload }) => {
+      const message = JSON.parse(String(payload))
+      if (message.type === 'resize' && message.cols) reports.push({ cols: message.cols, rows: message.rows })
+    }))
+    await page.goto(app.url + '?session=prime')
+    const shell = page.locator('[data-tmux-cc-shell]')
+    await expect(page.locator('.xterm')).toHaveCount(1)
+    await expect(shell).toHaveAttribute('data-size-mode', 'takeover')
+    const nativeGrid = async () => {
+      const { stdout } = await native('display-message', '-p', '-t', 'prime', '#{window_width} #{window_height}')
+      const [cols, rows] = stdout.trim().split(' ').map(Number)
+      return { cols, rows }
+    }
+    await expect.poll(async () => {
+      const report = reports.at(-1)
+      if (!report) return 'no-report'
+      const grid = await nativeGrid()
+      return grid.cols === report.cols && grid.rows === report.rows ? 'match' : `${grid.cols}x${grid.rows} vs ${report.cols}x${report.rows}`
+    }, { timeout: 10000 }).toBe('match')
+    const report = reports.at(-1)
+    assert.ok(report)
+    assert.notDeepEqual(report, { cols: 100, rows: 30 })
+    assert.notDeepEqual(await nativeGrid(), { cols: 100, rows: 30 })
+    assert.equal((await native('show-options', '-wv', '-t', 'prime:0', 'window-size')).stdout.trim(), 'manual')
+
+    competitor.stdin.write('refresh-client -C 120x35\n')
+    await page.waitForTimeout(1200)
+    assert.deepEqual(await nativeGrid(), reports.at(-1))
+
+    await page.locator('.xterm').click()
+    await page.keyboard.type('x')
+
+    await page.locator('[data-tmux-cc-link]').click()
+    await expect.poll(async () => {
+      try {
+        return (await native('show-options', '-wv', '-t', 'prime:0', 'window-size')).stdout.trim()
+      } catch {
+        return ''
+      }
+    }, { timeout: 5000 }).toBe('')
+    await expect.poll(async () => {
+      const { stdout } = await native('display-message', '-p', '-t', 'prime', '#{window_width} #{window_height}')
+      return stdout.trim()
+    }, { timeout: 3000 }).toBe('120 35')
+
+    competitor.kill()
+    competitor = null
+    assert.deepEqual(errors, [])
+  } finally {
+    if (competitor) competitor.kill()
     if (browser) await browser.close()
     if (app) await app.close()
     await native('kill-server').catch(() => {})

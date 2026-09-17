@@ -31,6 +31,16 @@ export interface SocketLike {
   on(event: 'close', fn: () => void): void
 }
 
+
+/** One socket's pending history seed: which panes (null = all visible) and how deep. */
+interface CaptureRequest {
+  lines?: number
+  panes: Set<string> | null
+}
+/** Session → socket that most recently resized, typed, or attached. */
+const primarySizers = new Map<string, SocketLike>()
+
+
 export class TmuxRuntime {
   private readonly tmuxBin: string
   private readonly layouts: LayoutSpec[]
@@ -39,6 +49,8 @@ export class TmuxRuntime {
   /** Last selected session only; browser presentation preferences stay local. */
   private prefs: RuntimePrefs = { session: '' }
   private sockets = new Set<SocketLike>()
+  /** The websocket this runtime was bound to (one runtime per socket today). */
+  private sizingSocket: SocketLike | null = null
   /**
    * Dock grids reported by each browser client. Multiple devices share one
    * tmux control client, so takeover follows tmux's own multi-client rule:
@@ -49,6 +61,10 @@ export class TmuxRuntime {
   private desiredSizes = new Map<SocketLike, { cols: number; rows: number }>()
   private sizeMode: 'mirror' | 'takeover' = 'mirror'
   private appliedSize = ''
+  /** Windows this runtime put into `window-size manual` via resize-window. */
+  private manualWindows = new Set<string>()
+  /** Last window `resize-window` was applied to; empty until a primary apply. */
+  private appliedWindowId = ''
   private viewerPoll: ReturnType<typeof setInterval> | null = null
   /** Serialize and coalesce flag/grid changes so snapshots cannot race modes. */
   private sizePolicyTask: Promise<void> | null = null
@@ -57,8 +73,8 @@ export class TmuxRuntime {
   private sizePolicyRetryDelay = 250
   /** Invalidates policy writes that were awaiting a replaced/detached control client. */
   private attachmentGeneration = 0
-  /** At most one pending capture per socket and one active capture drain globally. */
-  private captureRequests = new Map<SocketLike, { lines?: number; pane?: string }>()
+  /** Pending captures per socket (`panes: null` = every visible pane) and one active drain globally. */
+  private captureRequests = new Map<SocketLike, CaptureRequest>()
   private captureTask: Promise<void> | null = null
   private readonly management: TmuxManagement
   /** Inventory, management writes, and wire attachment changes share one queue. */
@@ -69,7 +85,10 @@ export class TmuxRuntime {
     this.tmuxBin = config.tmuxBin
     this.management = new TmuxManagement(this.tmuxBin, () => this.client?.controlClientName ?? '')
     this.layouts = config.layouts ?? []
-    const fallback = config.sizePolicy === 'mirror' ? 'mirror' : DEFAULT_SETTINGS.sizePolicy
+    const requested = config.sizePolicy
+    const fallback = requested === 'primary' || requested === 'auto' || requested === 'mirror'
+      ? requested
+      : DEFAULT_SETTINGS.sizePolicy
     this.getSizePolicy = config.getSizePolicy ?? (() => fallback)
   }
 
@@ -88,25 +107,38 @@ export class TmuxRuntime {
   }
 
   private sizePolicy(): SizePolicy {
-    return this.getSizePolicy() === 'mirror' ? 'mirror' : 'auto'
+    const policy = this.getSizePolicy()
+    return policy === 'primary' || policy === 'auto' || policy === 'mirror' ? policy : DEFAULT_SETTINGS.sizePolicy
   }
+
 
   /** Re-apply a newly committed host setting and publish the resulting mode. */
   settingsChanged(): void {
-    const client = this.client
-    const snap = client?.currentSnapshot()
-    if (client && client.attached && snap) {
-      void this.queueSizePolicy()
-        .catch(() => { /* transient */ })
-        .finally(() => {
-          const latest = client.currentSnapshot() ?? snap
-          this.broadcast({ type: 'snapshot', snapshot: this.toSnapshot(latest, true) })
-        })
-      return
-    }
-    void this.snapshot().then((snapshot) => this.broadcast({ type: 'snapshot', snapshot }))
-      .catch((error: unknown) => this.broadcastError(error))
+    void (async () => {
+      if (this.sizePolicy() !== 'primary') {
+        await this.restoreManualWindows()
+        this.sizeMode = 'mirror'
+        this.appliedSize = ''
+        this.appliedWindowId = ''
+      }
+      const client = this.client
+      const snap = client?.currentSnapshot()
+      if (client && client.attached && snap) {
+        try {
+          await this.queueSizePolicy()
+        } catch { /* transient */ }
+        const latest = client.currentSnapshot() ?? snap
+        this.broadcast({ type: 'snapshot', snapshot: this.toSnapshot(latest, true) })
+        return
+      }
+      try {
+        this.broadcast({ type: 'snapshot', snapshot: await this.snapshot() })
+      } catch (error: unknown) {
+        this.broadcastError(error)
+      }
+    })()
   }
+
 
   async snapshot(): Promise<Snapshot> {
     if (this.client?.attached) {
@@ -142,9 +174,10 @@ export class TmuxRuntime {
     if (this.client.attached && this.client.session !== resolved) {
       // A new control attachment always starts with ignore-size. Do not carry
       // the old attachment's takeover bookkeeping across the boundary.
-      await this.sizePolicyTask?.catch(() => { /* the detach below supersedes it */ })
-      this.resetSizeState(false)
       this.attachmentGeneration += 1
+      await this.sizePolicyTask?.catch(() => { /* the detach below supersedes it */ })
+      await this.restoreManualWindows()
+      this.resetSizeState(false)
       this.client.detach()
     }
     if (!this.client.attached) {
@@ -153,17 +186,20 @@ export class TmuxRuntime {
       this.attachmentGeneration += 1
       await this.client.attach(resolved)
       this.startViewerPoll()
+      if (this.sizingSocket) this.claimSizing(this.sizingSocket)
       // Browser votes survive a manual detach/session switch, so enforce them
       // against the fresh ignore-size client before reporting its mode.
       await this.queueSizePolicy()
     }
     this.setPrefs({ session: resolved })
+    if (this.sizingSocket) this.claimSizing(this.sizingSocket)
     return this.snapshot()
   }
 
-  detach(): void {
-    this.resetSizeState(false)
+  async detach(): Promise<void> {
     this.attachmentGeneration += 1
+    await this.restoreManualWindows()
+    this.resetSizeState(false)
     this.captureRequests.clear()
     this.client?.detach()
     void this.snapshot().then((snap) => this.broadcast({ type: 'snapshot', snapshot: snap }))
@@ -172,26 +208,73 @@ export class TmuxRuntime {
 
   dispose(): void {
     this.disposed = true
-    this.resetSizeState(true)
     this.attachmentGeneration += 1
+    const client = this.client
+    const restored = this.restoreManualWindows()
+    if (this.sizingSocket) this.releaseSizing(this.sizingSocket)
+    this.resetSizeState(true)
     this.captureRequests.clear()
-    this.client?.detach()
     this.client = null
     for (const socket of this.sockets) socket.close(1001, 'plugin unload')
     this.sockets.clear()
+    this.sizingSocket = null
+    void restored.finally(() => { client?.detach() })
   }
 
+
   /**
-   * Size policy. Someone else at the table (a real seat or an iTerm -CC
-   * client) → mirror: we ignore-size and scale our rendering. Alone → the
-   * dock dictates the window geometry at its native font size.
+   * Size policy. Primary → this browser dictates the window via resize-window
+   * (control client stays ignore-size). Auto: someone else at the table (a
+   * real seat or an iTerm -CC client) → mirror; alone → the dock dictates
+   * via the client-size path. Mirror: never resize.
    */
   private async applySizePolicy(snap: TmuxSnapshot): Promise<void> {
     const client = this.client
     if (client === null || !client.attached) return
     const generation = this.attachmentGeneration
-    const desiredSize = this.effectiveSize()
     const policy = this.sizePolicy()
+    const stillCurrent = (): boolean => (
+      this.client === client && client.attached && this.attachmentGeneration === generation
+    )
+
+    if (policy === 'primary') {
+      // Auto takeover may have cleared ignore-size; primary never participates.
+      if (this.sizeMode === 'takeover' && this.appliedWindowId === '') {
+        await client.setIgnoreSize(true)
+        if (!stillCurrent()) return
+      }
+      const holder = primarySizers.get(this.sizingSession())
+      const desiredSize = this.holdsSizing() && holder !== undefined
+        ? (this.desiredSizes.get(holder) ?? null)
+        : null
+      if (desiredSize === null) {
+        this.sizeMode = 'mirror'
+        this.appliedSize = ''
+        this.appliedWindowId = ''
+        return
+      }
+      const needsResize = snap.windowId !== this.appliedWindowId
+        || snap.cols !== desiredSize.cols
+        || snap.rows !== desiredSize.rows
+      if (needsResize) {
+        await client.resizeWindow(snap.windowId, desiredSize.cols, desiredSize.rows)
+        this.manualWindows.add(snap.windowId)
+        await client.refreshSnapshot()
+        if (!stillCurrent()) return
+        if (!this.holdsSizing()) {
+          this.sizeMode = 'mirror'
+          this.appliedSize = ''
+          this.appliedWindowId = ''
+          return
+        }
+        this.appliedWindowId = snap.windowId
+        this.appliedSize = `${desiredSize.cols}x${desiredSize.rows}`
+      }
+      this.sizeMode = 'takeover'
+      return
+    }
+
+    const desiredSize = this.effectiveSize()
     // Never grant takeover from a cached zero. Another normal/iTerm client can
     // attach between the five-second polls, so verify directly before every
     // browser-driven sizing write; a failed check is conservatively a viewer.
@@ -199,9 +282,6 @@ export class TmuxRuntime {
     if (policy === 'auto' && viewers === 0 && desiredSize !== null) {
       viewers = await client.countViewers().catch(() => 1)
     }
-    const stillCurrent = (): boolean => (
-      this.client === client && client.attached && this.attachmentGeneration === generation
-    )
     // With another real seat, or with no visible desktop dock volunteering a
     // grid, this control client is a pure mirror. In particular, closing a
     // dock or crossing into the mobile breakpoint must release its old size.
@@ -228,6 +308,7 @@ export class TmuxRuntime {
       this.appliedSize = key
     }
   }
+
 
   /**
    * Reconcile against the newest snapshot after earlier writes settle. Bursts
@@ -298,12 +379,55 @@ export class TmuxRuntime {
   private resetSizeState(clearDesiredSizes: boolean): void {
     this.sizeMode = 'mirror'
     this.appliedSize = ''
+    this.appliedWindowId = ''
     this.sizePolicyDirty = false
     if (clearDesiredSizes) this.desiredSizes.clear()
     this.clearSizePolicyRetry()
-    if (this.viewerPoll) clearInterval(this.viewerPoll)
+    clearInterval(this.viewerPoll)
     this.viewerPoll = null
   }
+
+  private sizingSession(): string {
+    return this.client?.session || this.prefs.session || ''
+  }
+
+  private claimSizing(socket: SocketLike): void {
+    for (const [name, holder] of primarySizers) {
+      if (holder === socket) primarySizers.delete(name)
+    }
+    const session = this.sizingSession()
+    if (session === '') return
+    primarySizers.set(session, socket)
+  }
+
+  private releaseSizing(socket: SocketLike): void {
+    for (const [name, holder] of primarySizers) {
+      if (holder === socket) primarySizers.delete(name)
+    }
+  }
+
+  private holdsSizing(socket?: SocketLike): boolean {
+    const session = this.sizingSession()
+    if (session === '') return false
+    const holder = primarySizers.get(session)
+    if (holder === undefined) return false
+    if (socket !== undefined) return holder === socket
+    return this.sockets.has(holder)
+  }
+
+  private async restoreManualWindows(): Promise<void> {
+    const client = this.client
+    const windows = [...this.manualWindows]
+    this.manualWindows.clear()
+    this.appliedWindowId = ''
+    if (client === null || !client.attached) return
+    for (const windowId of windows) {
+      try {
+        await client.unsetWindowSize(windowId)
+      } catch { /* window gone */ }
+    }
+  }
+
 
   /** Watch for seats appearing/disappearing; tmux has no notification for it. */
   private startViewerPoll(): void {
@@ -322,6 +446,7 @@ export class TmuxRuntime {
   }
 
   bind(socket: SocketLike): void {
+    this.sizingSocket = socket
     this.sockets.add(socket)
     void this.snapshot().then((snap) => {
       socket.send(JSON.stringify({ type: 'snapshot', snapshot: snap } satisfies HostToClient))
@@ -336,12 +461,15 @@ export class TmuxRuntime {
     socket.on('close', () => {
       this.sockets.delete(socket)
       this.captureRequests.delete(socket)
+      this.releaseSizing(socket)
+      if (this.sizingSocket === socket) this.sizingSocket = null
       // A departing viewer may unblock a larger shared grid.
       if (this.desiredSizes.delete(socket)) {
         void this.queueSizePolicy().catch(() => { /* transient */ })
       }
     })
   }
+
 
   /** A layout id is accepted anywhere a session name is; it maps to its session. */
   private resolveSession(nameOrLayoutId: string): string {
@@ -409,9 +537,16 @@ export class TmuxRuntime {
     return client
   }
 
-  /** Coalesce capture spam to the newest pending request per socket. */
+  /** Coalesce capture requests per socket: pane sets merge, "all" absorbs. */
   private requestCapture(socket: SocketLike, lines?: number, pane?: string): void {
-    this.captureRequests.set(socket, { lines, pane })
+    const pending = this.captureRequests.get(socket)
+    if (pending === undefined) {
+      this.captureRequests.set(socket, { lines, panes: pane === undefined ? null : new Set([pane]) })
+    } else {
+      if (lines !== undefined) pending.lines = lines
+      if (pane === undefined) pending.panes = null
+      else pending.panes?.add(pane)
+    }
     if (this.captureTask !== null) return
     const run = this.drainCaptures()
     this.captureTask = run
@@ -419,22 +554,19 @@ export class TmuxRuntime {
       .finally(() => {
         this.captureTask = null
         // Defensive against a request arriving as the drain settles.
-        if (this.captureRequests.size > 0) {
-          const next = this.captureRequests.entries().next().value as [
-            SocketLike,
-            { lines?: number; pane?: string },
-          ] | undefined
-          if (next !== undefined) this.requestCapture(next[0], next[1].lines, next[1].pane)
+        const next = this.captureRequests.entries().next().value as [SocketLike, CaptureRequest] | undefined
+        if (next !== undefined) {
+          const [nextSocket, request] = next
+          this.captureRequests.delete(nextSocket)
+          if (request.panes === null) this.requestCapture(nextSocket, request.lines)
+          else for (const paneId of request.panes) this.requestCapture(nextSocket, request.lines, paneId)
         }
       })
   }
 
   private async drainCaptures(): Promise<void> {
     while (this.captureRequests.size > 0) {
-      const entry = this.captureRequests.entries().next().value as [
-        SocketLike,
-        { lines?: number; pane?: string },
-      ] | undefined
+      const entry = this.captureRequests.entries().next().value as [SocketLike, CaptureRequest] | undefined
       if (entry === undefined) return
       const [socket, request] = entry
       this.captureRequests.delete(socket)
@@ -442,9 +574,8 @@ export class TmuxRuntime {
       const generation = this.attachmentGeneration
       if (client === null || !client.attached) continue
       try {
-        const paneIds = request.pane === undefined
-          ? (client.currentSnapshot()?.panes ?? []).map((pane) => pane.id)
-          : [request.pane]
+        const visible = (client.currentSnapshot()?.panes ?? []).map((pane) => pane.id)
+        const paneIds = request.panes === null ? visible : visible.filter((id) => request.panes!.has(id))
         // Send each seed as soon as that pane's command closes. Holding all
         // panes until the final capture would let pane-one live output arrive
         // before pane-one history and then be reset away in the browser.
@@ -539,16 +670,20 @@ export class TmuxRuntime {
     }
     if (msg.type === 'attach') {
       const snap = await this.attach(msg.session)
+      this.claimSizing(socket)
+      if (this.sizePolicy() === 'primary') await this.queueSizePolicy()
       socket.send(JSON.stringify({ type: 'snapshot', snapshot: snap } satisfies HostToClient))
       return
     }
     if (msg.type === 'detach') {
-      await this.queueManagement(async () => { this.detach() })
+      await this.queueManagement(async () => { await this.detach() })
       return
     }
     if (msg.type === 'resize') {
       if ('active' in msg) {
-        if (this.desiredSizes.delete(socket)) await this.queueSizePolicy()
+        this.releaseSizing(socket)
+        const had = this.desiredSizes.delete(socket)
+        if (had || this.sizePolicy() === 'primary') await this.queueSizePolicy()
         return
       }
       const cols = Number(msg.cols)
@@ -558,13 +693,19 @@ export class TmuxRuntime {
           cols: Math.max(20, Math.min(500, Math.floor(cols))),
           rows: Math.max(6, Math.min(300, Math.floor(rows))),
         })
+        this.claimSizing(socket)
         await this.queueSizePolicy()
       }
       return
     }
     const client = this.client
     if (client === null || !client.attached) throw new Error('not attached')
-    if (msg.type === 'input') { await client.sendKeys(msg.pane, msg.data); return }
+    if (msg.type === 'input') {
+      this.claimSizing(socket)
+      await client.sendKeys(msg.pane, msg.data)
+      if (this.sizePolicy() === 'primary') await this.queueSizePolicy()
+      return
+    }
     if (msg.type === 'select') { await client.selectPane(msg.pane); return }
     if (msg.type === 'swap') {
       if (

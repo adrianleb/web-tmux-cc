@@ -61,7 +61,7 @@ export const DEFAULT_PREFS: DockPrefs = {
   applyFontToHarness: false,
 }
 
-export type SizePolicy = 'auto' | 'mirror'
+export type SizePolicy = 'primary' | 'auto' | 'mirror'
 
 /** Host-shared durable settings; these affect the one shared tmux control client. */
 export interface TmuxSettings {
@@ -69,7 +69,7 @@ export interface TmuxSettings {
 }
 
 export const DEFAULT_SETTINGS: TmuxSettings = {
-  sizePolicy: 'auto',
+  sizePolicy: 'primary',
 }
 
 /** Compatibility surface for the legacy /prefs endpoint. */
